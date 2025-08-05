@@ -1,0 +1,647 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Balance Sheet Maker</title>
+  <link rel="stylesheet" href="style.css" />
+  <script src="https://unpkg.com/xlsx/dist/xlsx.full.min.js"></script>
+  <style>
+    .sortable-header {
+      cursor: pointer;
+      user-select: none;
+    }
+    .sortable-header:hover {
+      background-color: #f0f0f0;
+    }
+    .sort-icon {
+      margin-left: 5px;
+    }
+  </style>
+</head>
+
+<body>
+
+<h2>Financial Statements Maker</h2>
+
+<div>
+  <label for="upload">Upload Trial Balance Excel (sheet "TB"):</label>
+  <input type="file" id="upload" accept=".xlsx,.xls" />
+</div>
+
+<div>
+  <button id="fillTemplateBtn" disabled>Download Unformatted Financials</button>
+  <button id="export" disabled>Export Mapped Trial Balance</button>
+  <button id="downloadJsonBtn" disabled>Download Filled Financials</button>
+
+</div>
+
+<div id="error"></div>
+
+<div id="tabs" class="tabs" style="display:none;">
+  <button class="tab-button active" data-tab="Assets">Assets</button>
+  <button class="tab-button" data-tab="Liabilities">Liabilities</button>
+  <button class="tab-button" data-tab="Income">Income</button>
+  <button class="tab-button" data-tab="Expenses">Expenses</button>
+</div>
+
+<div id="tab-contents" style="margin-top:10px; max-width:100%;">
+  <div id="tab-Assets" class="tab-content"></div>
+  <div id="tab-Liabilities" class="tab-content" style="display:none;"></div>
+  <div id="tab-Income" class="tab-content" style="display:none;"></div>
+  <div id="tab-Expenses" class="tab-content" style="display:none;"></div>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", () => {
+
+  let transformedSheets = {};
+  let class2Map = {};
+  let class3Map = {};
+  let templateWorkbook = null;
+  let templateBytes = null;
+  let mappingJson = null;
+  let templateSheetName = null;
+  // Store current sort state for each tab
+  let sortStates = {
+    Assets: { column: null, direction: 'asc' },
+    Liabilities: { column: null, direction: 'asc' },
+    Income: { column: null, direction: 'asc' },
+    Expenses: { column: null, direction: 'asc' }
+  };
+
+  const fillBtn = document.getElementById("fillTemplateBtn");
+  const exportBtn = document.getElementById("export");
+  const errorEl = document.getElementById("error");
+  const tabsDiv = document.getElementById("tabs");
+
+  // Load class2.json and class3.json
+  Promise.all([
+    fetch("class2.json").then(r => { if (!r.ok) throw new Error("Failed to load class2.json"); return r.json(); }),
+    fetch("class3.json").then(r => { if (!r.ok) throw new Error("Failed to load class3.json"); return r.json(); })
+  ]).then(([cls2, cls3]) => {
+    class2Map = cls2;
+    class3Map = cls3;
+    console.log("Loaded class2 and class3 mapping");
+  }).catch(err => {
+    console.warn("Could not load class2 or class3 JSON files", err);
+    class2Map = {};
+    class3Map = {};
+  });
+
+  // Auto-load template.xlsx
+  fetch('template.xlsx')
+    .then(r => { if(!r.ok) throw new Error('Failed to load template.xlsx'); return r.arrayBuffer(); })
+    .then(buffer => {
+      templateBytes = buffer;
+      templateWorkbook = XLSX.read(buffer, {type: 'array'});
+      templateSheetName = templateWorkbook.SheetNames[0];
+      checkReady();
+      console.log('template.xlsx loaded');
+    })
+    .catch(err => {
+      console.error('Error loading template.xlsx:', err);
+      errorEl.textContent = 'Error loading template.xlsx. Please place it in the same folder.';
+    });
+
+  // Auto-load mapping.json
+  fetch('mapping.json')
+    .then(r => { if(!r.ok) throw new Error('Failed to load mapping.json'); return r.json(); })
+    .then(json => {
+      mappingJson = json;
+      checkReady();
+      console.log('mapping.json loaded');
+    })
+    .catch(err => {
+      console.error('Error loading mapping.json:', err);
+      errorEl.textContent = 'Error loading mapping.json. Please place it in the same folder.';
+    });
+
+  function checkReady() {
+    fillBtn.disabled = !(templateWorkbook && mappingJson && Object.keys(transformedSheets).length > 0);
+  }
+
+  // Utilities
+  function cleanText(s) { return typeof s === "string" ? s.toLowerCase().replace(/[.\s]/g, "") : ""; }
+  function isInArrayCI(val, arr) { return val && arr.some(x => x.toUpperCase() === val.toUpperCase()); }
+  function rowMatchesKeywords(r, keys) {
+    return keys.some(k => {
+      const kl = k.toLowerCase();
+      return cleanText(r.Name).includes(kl) || cleanText(r.Parent).includes(kl) || cleanText(r.PrimaryGroup).includes(kl);
+    });
+  }
+  function removeColumns(rows, cols) {
+    return rows.map(r => {
+      const c = {...r};
+      cols.forEach(x => delete c[x]);
+      return c;
+    });
+  }
+
+  function standardizeRows(rows) {
+    return rows.map(r => {
+      const cls2 = r.Class2 || (class2Map[r.CategoryLabel] && class2Map[r.CategoryLabel][0]) || "Default";
+      const cls3 = r.Class3 || (class3Map[cls2] && class3Map[cls2][0]) || "";
+      return {
+        Name: r.Name || "",
+        CY: Number(r.CY) || 0,
+        PY: Number(r.PY) || 0,
+        Class1: r.CategoryLabel || "",
+        Class2: cls2,
+        Class3: cls3
+      };
+    });
+  }
+
+  function sortData(data, column, direction) {
+    return [...data].sort((a, b) => {
+      let valA = a[column];
+      let valB = b[column];
+      
+      // Handle numeric columns
+      if (column === 'CY' || column === 'PY') {
+        return direction === 'asc' ? valA - valB : valB - valA;
+      }
+      
+      // Handle string columns
+      valA = String(valA || '').toLowerCase();
+      valB = String(valB || '').toLowerCase();
+      
+      if (valA < valB) return direction === 'asc' ? -1 : 1;
+      if (valA > valB) return direction === 'asc' ? 1 : -1;
+      return 0;
+    });
+  }
+
+  function createTable(sheetName) {
+    const data = transformedSheets[sheetName] || [];
+    const container = document.createElement("div");
+    const table = document.createElement("table");
+    container.className = "tab-table";
+
+    const cols = ["Name","CY","PY","Class1","Class2","Class3"];
+    const thead = document.createElement("thead");
+    const trhead = document.createElement("tr");
+    
+    cols.forEach(c => {
+      const th = document.createElement("th");
+      th.textContent = c;
+      th.className = "sortable-header";
+      th.dataset.column = c;
+      
+      // Add sort icon if this is the currently sorted column
+      if (sortStates[sheetName].column === c) {
+        const icon = document.createElement("span");
+        icon.className = "sort-icon";
+        icon.textContent = sortStates[sheetName].direction === 'asc' ? '↑' : '↓';
+        th.appendChild(icon);
+      }
+      
+      th.addEventListener("click", () => {
+        // Determine new sort direction
+        let newDirection = 'asc';
+        if (sortStates[sheetName].column === c) {
+          newDirection = sortStates[sheetName].direction === 'asc' ? 'desc' : 'asc';
+        }
+        
+        // Update sort state
+        sortStates[sheetName] = {
+          column: c,
+          direction: newDirection
+        };
+        
+        // Sort the data and refresh the table
+        transformedSheets[sheetName] = sortData(data, c, newDirection);
+        refreshTable(sheetName);
+      });
+      
+      trhead.appendChild(th);
+    });
+    
+    thead.appendChild(trhead);
+    table.appendChild(thead);
+
+    const tbody = document.createElement("tbody");
+    data.forEach((row,i) => {
+      const tr = document.createElement("tr");
+      cols.forEach(c => {
+        const td = document.createElement("td");
+        if(c === "Class2") {
+          const select = document.createElement("select");
+          const options = class2Map[row.Class1] || ["Default"];
+          options.forEach(opt => {
+            const option = document.createElement("option");
+            option.value = option.text = opt;
+            if(opt === row.Class2) option.selected = true;
+            select.appendChild(option);
+          });
+          select.addEventListener("change", e => {
+            transformedSheets[sheetName][i].Class2 = e.target.value;
+            const cs3Options = class3Map[e.target.value] || [];
+            transformedSheets[sheetName][i].Class3 = cs3Options.length ? cs3Options[0] : "";
+            refreshTable(sheetName);
+          });
+          td.appendChild(select);
+        } else if(c === "Class3") {
+          const options = class3Map[row.Class2] || [];
+          if(options.length) {
+            const select = document.createElement("select");
+            options.forEach(opt=>{
+              const option = document.createElement("option");
+              option.value = option.text = opt;
+              if(opt === row.Class3) option.selected = true;
+              select.appendChild(option);
+            });
+            select.addEventListener("change", e => {
+              transformedSheets[sheetName][i].Class3 = e.target.value;
+            });
+            td.appendChild(select);
+          }
+          else {
+            td.textContent = "";
+          }
+        } else {
+          td.textContent = row[c] ?? "";
+        }
+        tr.appendChild(td);
+      });
+      tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    container.appendChild(table);
+    return container;
+  }
+
+  function refreshTable(sheetName) {
+    const container = document.getElementById("tab-"+sheetName);
+    if(!container) return;
+    container.innerHTML = "";
+    container.appendChild(createTable(sheetName));
+  }
+
+  function showError(msg) {
+    errorEl.textContent = msg;
+    fillBtn.disabled = true;
+    exportBtn.disabled = true;
+    if(tabsDiv) tabsDiv.style.display = "none";
+    ["Assets","Liabilities","Income","Expenses"].forEach(s => {
+      const el = document.getElementById("tab-"+s);
+      if(el){ el.innerHTML = ""; el.style.display = "none"; }
+    });
+  }
+  function clearError() {
+    errorEl.textContent = "";
+  }
+
+  function setupTabs() {
+    if(!tabsDiv) return;
+    const buttons = tabsDiv.querySelectorAll(".tab-button");
+    buttons.forEach(btn => {
+      btn.onclick = () => {
+        buttons.forEach(b => b.classList.remove("active"));
+        btn.classList.add("active");
+        const sel = btn.dataset.tab;
+        ["Assets","Liabilities","Income","Expenses"].forEach(s => {
+          const el = document.getElementById("tab-"+s);
+          if(el) el.style.display = (s === sel) ? "block" : "none";
+        });
+      };
+    });
+  }
+  setupTabs();
+
+  // Ledger Upload & Process
+  document.getElementById("upload").addEventListener("change", e => {
+    clearError();
+    let file = e.target.files[0];
+    if(!file) {
+      showError("Please upload a Trial Balance Excel file.");
+      return;
+    }
+    fillBtn.disabled = true;
+    exportBtn.disabled = true;
+    if(tabsDiv) tabsDiv.style.display = "none";
+    ["Assets","Liabilities","Income","Expenses"].forEach(s => {
+      const el = document.getElementById("tab-"+s);
+      if(el) el.innerHTML = "";
+    });
+
+    const reader = new FileReader();
+    reader.onload = evt => {
+      try {
+        const data = new Uint8Array(evt.target.result);
+        const wb = XLSX.read(data, {type:"array"});
+        if(!wb.Sheets["TB"]) {
+          showError('Sheet "TB" not found.');
+          return;
+        }
+        let jsonData = XLSX.utils.sheet_to_json(wb.Sheets["TB"]);
+        if(!jsonData.length) {
+          showError('Sheet "TB" is empty.');
+          return;
+        }
+
+        jsonData = jsonData.map(({OnAccountValue, OnAccountValue3, ...rest}) => ({
+          ...rest,
+          CY: Number(OnAccountValue ?? rest.CY ?? rest.ClosingBalance ?? 0),
+          PY: Number(OnAccountValue3 ?? rest.PY ?? rest.ClosingBalance2 ?? 0),
+          Name: String(rest.Name ?? ""),
+          Parent: String(rest.Parent ?? ""),
+          PrimaryGroup: String(rest.PrimaryGroup ?? "")
+        }));
+
+        // Filtering and labeling logic from earlier message — fully implemented here:
+
+        // Liabilities
+        const liabilitiesPrimaryGroups = [
+          "Capital Account","Reserves & Surplus","Current Liabilities",
+          "Duties & Taxes","Provisions","Sundry Creditors",
+          "Loans (Liability)","Bank OD A/c","Secured Loans","Unsecured Loans"
+        ];
+        let liabRows = jsonData.filter(r =>
+          liabilitiesPrimaryGroups.includes(r.PrimaryGroup) || r.Name === "Profit & Loss A/c"
+        );
+        const borrowingsGroups = ["Unsecured Loans", "Secured Loans", "Loans (Liability)", "Bank OD A/c"];
+        const capitalGroup = "Capital Account";
+        const provisionsParent = "Provisions";
+        const sundryCreditorsGroup = "Sundry Creditors";
+        const surplusParentFilterList = ["#(0004) Primary", "Reserves & Surplus"];
+        const surplusNames = jsonData.filter(r => surplusParentFilterList.includes(r.PrimaryGroup) || (r.Name && r.Name.toLowerCase().includes("profit")))
+          .map(r => r.Name ? r.Name.toUpperCase() : "");
+
+        liabRows = liabRows.map(r => {
+          const nameUC = r.Name ? r.Name.toUpperCase() : "";
+          let label = "Other Liabilities";
+          if(isInArrayCI(r.PrimaryGroup, borrowingsGroups)) label = "Borrowings";
+          else if((r.PrimaryGroup || "").toUpperCase() === capitalGroup.toUpperCase()) label = "Capital";
+          else if((r.Parent || "").toUpperCase() === provisionsParent.toUpperCase()) label = "Provisions";
+          else if(isInArrayCI(r.PrimaryGroup, [sundryCreditorsGroup])) label = "Sundry Creditors";
+          else if(surplusNames.includes(nameUC)) label = "Surplus";
+          return {...r, CategoryLabel: label};
+        });
+        liabRows = removeColumns(liabRows, ["Parent", "PrimaryGroup", "ClosingBalance", "ClosingBalance2"]);
+
+        // Assets
+        const assetsPrimaryGroups = [
+          "Bank Accounts", "Cash-in-hand", "Fixed Assets", "Stock-in-Hand",
+          "Sundry Debtors", "Deposits (Asset)", "Investments",
+          "Misc. Expenses (ASSET)", "Loans & Advances (Asset)"
+        ];
+        let assetRows = jsonData.filter(r => assetsPrimaryGroups.includes(r.PrimaryGroup))
+          .map(r => ({...r, CY: -r.CY, PY: -r.PY}));
+        const processAssetsGroup = (rows, label, removeCols=["Parent","PrimaryGroup","ClosingBalance","ClosingBalance2"]) =>
+          removeColumns(rows, removeCols).map(r => ({...r,CategoryLabel: label}));
+
+        const advancesRows = processAssetsGroup(assetRows.filter(r => r.Parent === "Loans & Advances (Asset)"), "Advances");
+        const cashBankRows = processAssetsGroup(assetRows.filter(r => {
+          const pgL = r.PrimaryGroup.toLowerCase();
+          const nmL = r.Name.toLowerCase();
+          return ["bank accounts","cash-in-hand"].includes(pgL) || nmL.includes("cash") || nmL.includes("bank");
+        }), "CashBank");
+        const closingStockRaw = assetRows.filter(r => r.PrimaryGroup === "Stock-in-Hand");
+        const closingStockRemoved = removeColumns(closingStockRaw, ["Parent", "PrimaryGroup", "CY", "PY"]);
+        const closingStockRows = closingStockRemoved.map(r => ({
+          Name: r.Name,
+          CY: r.ClosingBalance || 0,
+          PY: r.ClosingBalance2 || 0,
+          CategoryLabel: "ClosingStock"
+        }));
+        const fixedAssetsRows = processAssetsGroup(assetRows.filter(r => r.PrimaryGroup === "Fixed Assets"), "FixedAssets");
+        const sundryDebtorsRows = processAssetsGroup(assetRows.filter(r => r.PrimaryGroup === "Sundry Debtors"), "SundryDebtors");
+        const investmentsRows = processAssetsGroup(assetRows.filter(r => r.PrimaryGroup === "Investments"), "Investments");
+        const combinedAssetNames = [
+          ...advancesRows, ...cashBankRows, ...closingStockRows,
+          ...fixedAssetsRows, ...sundryDebtorsRows, ...investmentsRows
+        ].map(r => (r.Name || '').toUpperCase());
+        let otherAssetsRows = assetRows.filter(r => !combinedAssetNames.includes(r.Name.toUpperCase()));
+        otherAssetsRows = processAssetsGroup(otherAssetsRows, "OtherAssets");
+        const labeledAssets = [
+          ...advancesRows, ...cashBankRows, ...closingStockRows,
+          ...fixedAssetsRows, ...otherAssetsRows, ...sundryDebtorsRows, ...investmentsRows
+        ];
+
+        // Income
+        const incomeBaseRows = jsonData.filter(r => r.Parent === "Sales Accounts" || r.Parent === "Indirect Incomes");
+        const salesAccountsRows = removeColumns(incomeBaseRows.filter(r => r.Parent === "Sales Accounts"), ["Parent", "PrimaryGroup", "ClosingBalance", "ClosingBalance2"]).map(r => ({...r, CategoryLabel: "SalesAccounts"}));
+        const otherIncomeRows = removeColumns(incomeBaseRows.filter(r => r.Parent === "Indirect Incomes"), ["Parent", "PrimaryGroup", "ClosingBalance", "ClosingBalance2"]).map(r => ({...r, CategoryLabel: "OtherIncome"}));
+        let incomeRows = [...salesAccountsRows, ...otherIncomeRows];
+        incomeRows = incomeRows.map(({ClosingBalance, ClosingBalance2, ...rest}) => rest);
+
+        // Expenses
+        let expensesRows = jsonData.filter(r =>
+          r.PrimaryGroup === "Indirect Expenses" || r.Parent === "Purchase Accounts" || r.Parent === "Direct Expenses" || r.Parent === "Stock-in-Hand"
+        );
+        expensesRows = expensesRows.map(r => ({...r,CY: -r.CY, PY: -r.PY}));
+
+        const stockRows = expensesRows.filter(r => r.Parent === "Stock-in-Hand").map(r => ({Name: r.Name, CY: r.CY, PY: r.PY, CategoryLabel: "Stock"}));
+        const cogsRows = expensesRows.filter(r => {
+          const nl = (r.Name || '').toLowerCase();
+          return r.PrimaryGroup !== "Indirect Expenses" && r.Parent !== "Stock-in-Hand" && !nl.includes("wage") && !nl.includes("salary");
+        }).map(r => ({Name: r.Name, CY: r.CY, PY: r.PY, CategoryLabel: "COGS"})).concat(stockRows);
+
+        const depKeywords = ["dep", "amort"];
+        const depreciationRows = expensesRows.filter(r => r.Parent === "Indirect Expenses" && depKeywords.some(k => (r.Name || '').toLowerCase().includes(k))).map(r => ({Name: r.Name, CY: r.CY, PY: r.PY, CategoryLabel: "Depreciation"}));
+
+        const empKeywords = ["sala", "staff", "wage", "pf", "p.f.", "provident", "emp", "esi", "contri", "gratuity", "epf", "labour", "e p f"];
+        const employeeBenefitRows = expensesRows
+  .filter(r => {
+    const nameMatch = rowMatchesKeywords(r, empKeywords);
+    const parentMatch = empKeywords.some(k => (r.Parent || '').toLowerCase().includes(k));
+    return nameMatch || parentMatch;
+  })
+  .map(r => ({
+    Name: r.Name,
+    CY: r.CY,
+    PY: r.PY,
+    CategoryLabel: "EmployeeBenefit"
+  }));
+
+
+        const financeKeywords = ["interest", "intr", "inter", "fin"];
+        const financeCostRows = expensesRows
+  .filter(r => {
+    const nameMatch = rowMatchesKeywords(r, financeKeywords);
+    const parentMatch = financeKeywords.some(k => (r.Parent || '').toLowerCase().includes(k));
+    return nameMatch || parentMatch;
+  })
+  .map(r => ({
+    Name: r.Name,
+    CY: r.CY,
+    PY: r.PY,
+    CategoryLabel: "FinanceCost"
+  }));
+
+
+        const taxKeywords = ["income tax", "current tax", "deferred tax", "def"];
+        const taxExpRows = expensesRows.filter(r => taxKeywords.some(k => (r.Name || '').toLowerCase().includes(k))).map(r => ({Name: r.Name, CY: r.CY, PY: r.PY, CategoryLabel: "TaxExp"}));
+
+        const exceptionalRows = expensesRows.filter(r => (r.Parent || '').toLowerCase().includes("excp")).map(r => ({Name: r.Name, CY: r.CY, PY: r.PY, CategoryLabel: "Exceptional"}));
+
+        const excludedNames = new Set([...stockRows, ...cogsRows, ...depreciationRows, ...employeeBenefitRows, ...financeCostRows, ...taxExpRows, ...exceptionalRows].map(r => r.Name.toUpperCase()));
+
+        const otherExpensesRows = expensesRows.filter(r => !excludedNames.has(r.Name.toUpperCase()) && r.Parent !== "Stock-in-Hand").map(r => ({Name: r.Name, CY: r.CY, PY: r.PY, CategoryLabel: "OtherExpenses"}));
+
+        expensesRows = [...cogsRows, ...depreciationRows, ...employeeBenefitRows, ...financeCostRows, ...taxExpRows, ...exceptionalRows, ...otherExpensesRows];
+
+        transformedSheets = {
+          Assets: standardizeRows(labeledAssets),
+          Liabilities: standardizeRows(liabRows),
+          Income: standardizeRows(incomeRows),
+          Expenses: standardizeRows(expensesRows)
+        };
+
+        clearError();
+        if(tabsDiv) tabsDiv.style.display = "block";
+        exportBtn.disabled = false;
+        checkReady();
+        enableJsonExport();
+
+        ["Assets","Liabilities","Income","Expenses"].forEach(s => {
+          const el = document.getElementById("tab-"+s);
+          if(el){
+            el.innerHTML = "";
+            el.appendChild(createTable(s));
+          }
+        });
+        ["Assets","Liabilities","Income","Expenses"].forEach(s => {
+          document.getElementById("tab-"+s).style.display = s === "Assets" ? "block" : "none";
+        });
+
+      } catch(e) {
+        showError("Error processing Trial Balance: " + e.message);
+        console.error(e);
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  });
+
+  // Fill Template & Export
+  fillBtn.addEventListener("click", () => {
+    if(!templateWorkbook || !mappingJson) {
+      alert("Template or mapping JSON not loaded.");
+      return;
+    }
+    if(!transformedSheets || Object.keys(transformedSheets).length === 0) {
+      alert("No ledger data to process.");
+      return;
+    }
+
+    let wb = XLSX.read(templateBytes, {type:"array"});
+    const targetSheetName = templateSheetName || wb.SheetNames[0];
+    const ws = wb.Sheets[targetSheetName];
+    if(!ws) {
+      alert("Template sheet "+ targetSheetName +" missing.");
+      return;
+    }
+
+    // Aggregate by Class2|Class3
+    const agg = {};
+    for(let sheetData of Object.values(transformedSheets)) {
+      for(let row of sheetData) {
+        const key = row.Class2 + "|" + (row.Class3 || "");
+        if(!agg[key]) agg[key] = {CY: 0, PY: 0};
+        agg[key].CY += row.CY || 0;
+        agg[key].PY += row.PY || 0;
+      }
+    }
+
+    function colToLetter(col) {
+      let s="";
+      while(col>0) {
+        let mod=(col-1)%26;
+        s=String.fromCharCode(65+mod)+s;
+        col=Math.floor((col-mod-1)/26);
+      }
+      return s;
+    }
+
+    for(let key in mappingJson){
+      const map = mappingJson[key];
+      if(!map.sheet || !map.row || !map.columnCY || !map.columnPY) {
+        console.warn("Mapping entry invalid for key: "+key);
+        continue;
+      }
+      if(!wb.Sheets[map.sheet]){
+        console.warn("Sheet "+map.sheet+" missing in template.");
+        continue;
+      }
+      const sheet=wb.Sheets[map.sheet];
+      const cellCY = colToLetter(map.columnCY) + map.row;
+      const cellPY = colToLetter(map.columnPY) + map.row;
+      const val = agg[key] || {CY:0, PY:0};
+      sheet[cellCY] = {t:"n", v: val.CY};
+      sheet[cellPY] = {t:"n", v: val.PY};
+      if(!sheet['!ref']) sheet['!ref'] = cellCY + ":" + cellPY;
+    }
+
+    XLSX.writeFile(wb, "FS_filled_"+(new Date()).toISOString().replace(/[:.]/g,"_")+".xlsx");
+  });
+
+  // Export Ledger Data Only
+  exportBtn.addEventListener("click", () => {
+    if(!transformedSheets || Object.keys(transformedSheets).length===0) {
+      alert("No ledger data available.");
+      return;
+    }
+    const wb = XLSX.utils.book_new();
+    for(const [sheet, data] of Object.entries(transformedSheets)){
+      const ws = XLSX.utils.json_to_sheet(data);
+      XLSX.utils.book_append_sheet(wb, ws, sheet);
+    }
+    XLSX.writeFile(wb, "Mapped_Trial_"+(new Date()).toISOString().replace(/[:.]/g,"_")+".xlsx");
+  });
+
+  function updateFillBtn() {
+    fillBtn.disabled = !(templateWorkbook && mappingJson && Object.keys(transformedSheets).length > 0);
+  }
+
+  // Check fill button on ledger data changes
+  function checkReady() {
+    updateFillBtn();
+  }
+
+  // Attach tab switching event
+  tabsDiv.addEventListener("click", e => {
+    if(!e.target.classList.contains("tab-button")) return;
+    const sel = e.target.dataset.tab;
+    document.querySelectorAll("#tabs .tab-button").forEach(btn => btn.classList.toggle("active", btn.dataset.tab === sel));
+    ["Assets","Liabilities","Income","Expenses"].forEach(name => {
+      const el = document.getElementById("tab-" + name);
+      if(el) el.style.display = (name === sel) ? "block" : "none";
+    });
+  });
+
+const jsonBtn = document.getElementById("downloadJsonBtn");
+
+function enableJsonExport() {
+  jsonBtn.disabled = false;
+  jsonBtn.onclick = () => {
+    fetch("http://localhost:5000/fill-template", {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(transformedSheets)
+    })
+    .then(response => {
+      if (!response.ok) throw new Error("Failed to fill template");
+      return response.blob();
+    })
+    .then(blob => {
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = "Filled_Output.xlsx";
+      a.click();
+      URL.revokeObjectURL(url);
+    })
+    .catch(err => {
+      alert("Error: " + err.message);
+    });
+  };
+}
+
+
+});
+</script>
+
+</body>
+</html>
