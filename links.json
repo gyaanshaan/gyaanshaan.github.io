@@ -1,0 +1,14 @@
+[
+  {
+    "headline": "Official Website",
+    "url": "https://youtube.com/yourchannel"
+  },
+  {
+    "headline": "GitHub Projects",
+    "url": "https://github.com/yourprofile"
+  },
+  {
+    "headline": "Contact Me",
+    "url": "mailto:email@example.com"
+  }
+]
